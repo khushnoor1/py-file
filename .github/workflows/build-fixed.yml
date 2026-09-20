@@ -18,276 +18,162 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Patch execution engine
+      - name: Patch ADB execution engine
         shell: pwsh
         run: |
           @'
           from pathlib import Path
+          import re
 
           p = Path('CommandCenter.py')
           s = p.read_text(encoding='utf-8')
 
-          old_target = '''    def _target_adb_commands(self, command, serial):
-          """Automatically bind every adb invocation in a user command to one DUT.
+          target_start = s.index('    def _target_adb_commands')
+          target_end = s.index('\n    def _show_install_dialog', target_start)
+          target = '''    def _target_adb_commands(self, command, serial):
+              """Bind ADB commands to one selected DUT without adding quote characters to the serial.
 
-          This prevents the Windows ADB error 'more than one device/emulator' when
-          multiple DUTs are connected. Existing explicit '-s SERIAL' targeting and
-          the {SERIAL} placeholder are preserved.
-          """
-          command = str(command or "").replace("{SERIAL}", serial)
-          # Add -s only when an adb invocation does not already specify a serial.
-          pattern = r'(?i)(\\badb(?:\\.exe)?\\s+)(?!-s(?:\\s|$))'
-          return re.sub(pattern, lambda m: m.group(1) + f'-s "{serial}" ', command)
-  '''
-          new_target = '''    def _target_adb_commands(self, command, serial):
-          """Bind every adb invocation to one DUT without introducing fragile quoting."""
-          serial = str(serial or "").strip().strip('"')
-          command = str(command or "").replace("{SERIAL}", serial)
-          if not serial:
-              return command
-          # ADB serials are passed without embedded quotes. This keeps the command
-          # identical whether it is executed directly or through cmd.exe/batch.
-          pattern = r'(?i)(\\badb(?:\\.exe)?\\s+)(?!-s(?:\\s|$))'
-          return re.sub(pattern, lambda m: m.group(1) + f'-s {serial} ', command)
-  '''
-          if old_target not in s:
-              raise SystemExit('target helper not found')
-          s = s.replace(old_target, new_target, 1)
+              Explicitly targeted commands (for example ``adb -s ABC123 ...``) are left
+              untouched. ``{SERIAL}`` is replaced with the raw ADB serial.
+              """
+              serial = str(serial or "").strip().strip('"')
+              command = str(command or "").replace("{SERIAL}", serial)
+              if not serial:
+                  return command
+              pattern = r'(?i)(\\badb(?:\\.exe)?\\s+)(?!-s(?:\\s|$)|--serial(?:\\s|=))'
+              return re.sub(pattern, lambda m: m.group(1) + f'-s {serial} ', command)
+          '''
+          s = s[:target_start] + target + s[target_end:]
 
-          old_exec = '''        for _, serial in targets:
-              # Every ADB invocation in the command receives this exact DUT's
-              # serial. {SERIAL} is also expanded for scripts/commands that need
-              # the serial as an argument or environment-independent placeholder.
-              dut_cmd = self._target_adb_commands(command, serial)
-              if typ in ("Batch Script", "PowerShell Script"):
-                  self._run_temp_script(dut_cmd, typ, serial)
-              else:
-                  self._run_process(dut_cmd, label=serial)
-
-
-    def _run_process(self, cmd_str, label=""):
-          def worker():
-              try:
-                  p = subprocess.Popen(cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=WIN_NO_CONSOLE)
-                  with self.active_processes_lock:
-                      self.active_processes.add(p)
-                  for line in iter(p.stdout.readline, ""):
-                      if self.stop_event.is_set():
-                          p.terminate()
-                          break
-                      self.log(f"[{label}] {line.strip()}")
-                  p.stdout.close()
-                  p.wait()
-                  with self.active_processes_lock:
-                      self.active_processes.discard(p)
-              except Exception as e:
-                  self.log(f"[{label}] Error: {e}")
-          threading.Thread(target=worker, daemon=True).start()
-
-    def _run_temp_script(self, script_text, typ, label):
-          suffix = ".ps1" if typ == "PowerShell Script" else ".bat"
-          fd, path = tempfile.mkstemp(prefix=f"cc_{label}_", suffix=suffix)
-          os.close(fd)
-          with open(path, "w", encoding="utf-8") as f:
-              f.write(script_text)
-          cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File", path] if typ == "PowerShell Script" else ["cmd", "/c", path]
-          self._run_process(subprocess.list2cmdline(cmd), label=label)
-'''
-          new_exec = '''        for _, serial in targets:
-              # Each selected DUT gets its own isolated execution. Scripts receive
-              # both SERIAL and DUT_SERIAL environment variables as well.
-              dut_cmd = self._target_adb_commands(command, serial)
-              if typ in ("Batch Script", "PowerShell Script"):
-                  self._run_temp_script(dut_cmd, typ, serial)
-              else:
-                  self._run_process(dut_cmd, label=serial, command_type=typ, serial=serial)
-
-
-    def _run_process(self, cmd_str, label="", command_type="CMD Command", serial=""):
-          """Run a command with one Windows command boundary and reliable diagnostics.
-
-          The previous implementation used shell=True on an already assembled command,
-          which added an extra cmd.exe parsing layer and made quoting/ADB targeting
-          unreliable. Direct ADB commands are now tokenized for one subprocess; generic
-          CMD commands use exactly one cmd.exe /d /s /c boundary.
-          """
-          def worker():
-              p = None
-              try:
-                  raw = str(cmd_str or "").strip()
-                  if not raw:
-                      self.log(f"[{label}] Error: empty command")
-                      return
-
-                  is_adb = bool(re.match(r'(?is)^\\s*adb(?:\\.exe)?\\s+', raw))
-                  if is_adb:
-                      try:
-                          args = subprocess.list2cmdline([])  # keep subprocess imported/available on Windows
-                          del args
-                          import shlex
-                          cmd_args = shlex.split(raw, posix=False)
-                          # shlex(posix=False) retains quote characters around arguments.
-                          # Strip only those wrapper quotes; never alter an argument itself.
-                          cmd_args = [a[1:-1] if len(a) >= 2 and a[0] == a[-1] == '"' else a for a in cmd_args]
-                      except Exception:
-                          cmd_args = None
-                      if cmd_args and cmd_args[0].lower() in ('adb', 'adb.exe'):
-                          launch = cmd_args
-                      else:
-                          launch = ["cmd.exe", "/d", "/s", "/c", raw]
-                  elif command_type == "PowerShell Script":
-                      launch = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", raw]
-                  else:
-                      launch = ["cmd.exe", "/d", "/s", "/c", raw]
-
-                  env = os.environ.copy()
-                  if serial:
-                      env["SERIAL"] = serial
-                      env["DUT_SERIAL"] = serial
-
-                  self.log(f"[{label}] EXEC: {raw}")
-                  p = subprocess.Popen(
-                      launch,
-                      shell=False,
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.STDOUT,
-                      stdin=subprocess.DEVNULL,
-                      text=True,
-                      encoding="utf-8",
-                      errors="replace",
-                      env=env,
-                      creationflags=WIN_NO_CONSOLE
-                  )
-                  with self.active_processes_lock:
-                      self.active_processes.add(p)
-
-                  if p.stdout is not None:
-                      for line in iter(p.stdout.readline, ""):
-                          if self.stop_event.is_set():
-                              try:
-                                  p.terminate()
-                              except Exception:
-                                  pass
-                              break
-                          text = line.rstrip()
-                          if text:
-                              self.log(f"[{label}] {text}")
-                      p.stdout.close()
-                  rc = p.wait()
-                  if rc == 0:
-                      self.log(f"[{label}] COMPLETED (exit 0)")
-                  else:
-                      self.log(f"[{label}] FAILED (exit {rc})")
-              except Exception as e:
-                  self.log(f"[{label}] Error: {type(e).__name__}: {e}")
-              finally:
-                  if p is not None:
-                      with self.active_processes_lock:
-                          self.active_processes.discard(p)
-          threading.Thread(target=worker, daemon=True).start()
-
-    def _run_temp_script(self, script_text, typ, label):
-          """Execute a temporary script through exactly one interpreter boundary and clean it up."""
-          suffix = ".ps1" if typ == "PowerShell Script" else ".bat"
-          fd, path = tempfile.mkstemp(prefix=f"cc_{re.sub(r'[^A-Za-z0-9_-]', '_', str(label))}_", suffix=suffix)
-          os.close(fd)
-          serial = str(label or "").strip().strip('"')
-          try:
-              text = str(script_text or "")
-              if typ == "Batch Script":
-                  # Explicitly set the target variables and make every line run in
-                  # one cmd.exe session. _target_adb_commands has already bound ADB.
-                  text = "@echo off\\nset \"SERIAL=" + serial + "\"\\nset \"DUT_SERIAL=" + serial + "\"\\n" + text
-                  with open(path, "w", encoding="utf-8", newline="\\r\\n") as f:
-                      f.write(text)
-                  launch = ["cmd.exe", "/d", "/c", "call", path]
-              else:
-                  with open(path, "w", encoding="utf-8", newline="\\n") as f:
-                      f.write(text)
-                  launch = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path]
-
+          exec_start = s.index('    def _run_process')
+          exec_end = s.index('\n    def stop_execution', exec_start)
+          execution = '''    def _run_process(self, cmd_str, label="", command_type="CMD Command", serial=""):
+              """Execute a command with predictable Windows process boundaries and diagnostics."""
               def worker():
                   p = None
                   try:
+                      raw = str(cmd_str or "").strip()
+                      if not raw:
+                          self.log(f"[{label}] Error: empty command")
+                          return
                       env = os.environ.copy()
-                      env["SERIAL"] = serial
-                      env["DUT_SERIAL"] = serial
-                      self.log(f"[{serial}] SCRIPT EXEC: {os.path.basename(path)}")
-                      p = subprocess.Popen(
-                          launch,
-                          shell=False,
-                          cwd=os.path.dirname(path),
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT,
-                          stdin=subprocess.DEVNULL,
-                          text=True,
-                          encoding="utf-8",
-                          errors="replace",
-                          env=env,
-                          creationflags=WIN_NO_CONSOLE
-                      )
+                      if serial:
+                          serial = str(serial).strip().strip('"')
+                          env["SERIAL"] = serial
+                          env["DUT_SERIAL"] = serial
+
+                      is_single_adb = bool(re.match(r'(?is)^\\s*adb(?:\\.exe)?\\s+', raw)) and not any(x in raw for x in ("&", "&&", "|", "\\n", "\\r"))
+                      if is_single_adb:
+                          import shlex
+                          parts = shlex.split(raw, posix=False)
+                          parts = [x[1:-1] if len(x) >= 2 and x[0] == x[-1] == '"' else x for x in parts]
+                          launch = parts if parts and parts[0].lower() in ("adb", "adb.exe") else ["cmd.exe", "/d", "/s", "/c", raw]
+                      elif command_type == "PowerShell Script":
+                          launch = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", raw]
+                      else:
+                          launch = ["cmd.exe", "/d", "/s", "/c", raw]
+
+                      self.log(f"[{label}] EXEC: {raw}")
+                      p = subprocess.Popen(launch, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                                           env=env, creationflags=WIN_NO_CONSOLE)
                       with self.active_processes_lock:
                           self.active_processes.add(p)
                       for line in iter(p.stdout.readline, ""):
                           if self.stop_event.is_set():
-                              try:
-                                  p.terminate()
-                              except Exception:
-                                  pass
+                              try: p.terminate()
+                              except Exception: pass
                               break
                           if line.strip():
-                              self.log(f"[{serial}] {line.rstrip()}")
+                              self.log(f"[{label}] {line.rstrip()}")
                       p.stdout.close()
                       rc = p.wait()
-                      self.log(f"[{serial}] SCRIPT {'COMPLETED' if rc == 0 else f'FAILED (exit {rc})'}")
+                      self.log(f"[{label}] {'COMPLETED' if rc == 0 else f'FAILED (exit {rc})'}")
                   except Exception as e:
-                      self.log(f"[{serial}] Script Error: {type(e).__name__}: {e}")
+                      self.log(f"[{label}] Error: {type(e).__name__}: {e}")
                   finally:
                       if p is not None:
                           with self.active_processes_lock:
                               self.active_processes.discard(p)
-                      try:
-                          os.remove(path)
-                      except OSError:
-                          pass
-
               threading.Thread(target=worker, daemon=True).start()
-          except Exception:
-              try:
-                  os.remove(path)
-              except OSError:
-                  pass
-              raise
-'''
-          if old_exec not in s:
-              raise SystemExit('execution block not found')
-          s = s.replace(old_exec, new_exec, 1)
 
-          # Fix direct adb reboot/command tokenization only; do not touch scrcpy or UI.
+          def _run_temp_script(self, script_text, typ, label):
+              """Run a saved Batch/PowerShell command for exactly one selected DUT."""
+              suffix = ".ps1" if typ == "PowerShell Script" else ".bat"
+              safe_label = re.sub(r"[^A-Za-z0-9_-]", "_", str(label or "DUT"))
+              fd, path = tempfile.mkstemp(prefix=f"cc_{safe_label}_", suffix=suffix)
+              os.close(fd)
+              serial = str(label or "").strip().strip('"')
+              try:
+                  text = str(script_text or "")
+                  if typ == "Batch Script":
+                      header = f'@echo off\\r\\nset "SERIAL={serial}"\\r\\nset "DUT_SERIAL={serial}"\\r\\n'
+                      text = header + text
+                      with open(path, "w", encoding="utf-8", newline="") as f:
+                          f.write(text.replace("\\n", "\\r\\n"))
+                      launch = ["cmd.exe", "/d", "/c", "call", path]
+                  else:
+                      with open(path, "w", encoding="utf-8", newline="\\n") as f:
+                          f.write(text)
+                      launch = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path]
+
+                  def worker():
+                      p = None
+                      try:
+                          env = os.environ.copy()
+                          env["SERIAL"] = serial
+                          env["DUT_SERIAL"] = serial
+                          self.log(f"[{serial}] SCRIPT EXEC: {os.path.basename(path)}")
+                          p = subprocess.Popen(launch, shell=False, cwd=os.path.dirname(path),
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                               stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                               errors="replace", env=env, creationflags=WIN_NO_CONSOLE)
+                          with self.active_processes_lock:
+                              self.active_processes.add(p)
+                          for line in iter(p.stdout.readline, ""):
+                              if self.stop_event.is_set():
+                                  try: p.terminate()
+                                  except Exception: pass
+                                  break
+                              if line.strip():
+                                  self.log(f"[{serial}] {line.rstrip()}")
+                          p.stdout.close()
+                          rc = p.wait()
+                          self.log(f"[{serial}] SCRIPT {'COMPLETED' if rc == 0 else f'FAILED (exit {rc})'}")
+                      except Exception as e:
+                          self.log(f"[{serial}] Script Error: {type(e).__name__}: {e}")
+                      finally:
+                          if p is not None:
+                              with self.active_processes_lock:
+                                  self.active_processes.discard(p)
+                          try: os.remove(path)
+                          except OSError: pass
+                  threading.Thread(target=worker, daemon=True).start()
+              except Exception:
+                  try: os.remove(path)
+                  except OSError: pass
+                  raise
+          '''
+          s = s[:exec_start] + execution + s[exec_end:]
           p.write_text(s, encoding='utf-8')
-          print('Patched CommandCenter.py successfully')
           '@ | Set-Content patch_cc.py -Encoding UTF8
           python patch_cc.py
-
-      - name: Validate Python syntax
-        shell: pwsh
-        run: |
           python -m py_compile CommandCenter.py
 
-      - name: Commit source fix
+      - name: Commit fixed source
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add CommandCenter.py
-          git commit -m "[CC-AUTO-FIX] Fix ADB and batch command execution" || exit 0
+          git commit -m "[CC-AUTO-FIX] Fix ADB and batch command execution"
           git push origin HEAD:main
 
       - name: Package final source
         shell: pwsh
         run: |
           if (Test-Path CommandCenter_Final.zip) { Remove-Item CommandCenter_Final.zip -Force }
-          Compress-Archive -Path * -DestinationPath CommandCenter_Final.zip -Force -Exclude '.git/*','CommandCenter_Final.zip'
+          Compress-Archive -Path CommandCenter.py -DestinationPath CommandCenter_Final.zip -Force
 
       - name: Upload final ZIP
         uses: actions/upload-artifact@v4
