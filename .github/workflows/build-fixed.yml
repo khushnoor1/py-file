@@ -49,6 +49,8 @@ jobs:
           exec_end = s.index('\n    def stop_execution', exec_start)
           execution = '''    def _run_process(self, cmd_str, label="", command_type="CMD Command", serial=""):
               """Execute a command with predictable Windows process boundaries and diagnostics."""
+              serial_clean = str(serial or "").strip().strip('"')
+
               def worker():
                   p = None
                   try:
@@ -57,10 +59,9 @@ jobs:
                           self.log(f"[{label}] Error: empty command")
                           return
                       env = os.environ.copy()
-                      if serial:
-                          serial = str(serial).strip().strip('"')
-                          env["SERIAL"] = serial
-                          env["DUT_SERIAL"] = serial
+                      if serial_clean:
+                          env["SERIAL"] = serial_clean
+                          env["DUT_SERIAL"] = serial_clean
 
                       is_single_adb = bool(re.match(r'(?is)^\\s*adb(?:\\.exe)?\\s+', raw)) and not any(x in raw for x in ("&", "&&", "|", "\\n", "\\r"))
                       if is_single_adb:
